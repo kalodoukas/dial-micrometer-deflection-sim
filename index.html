@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Dial Micrometer – v12 smooth zero-start indications</title>
+<title>Dial Micrometer – Manufacturer Limit Wear Index</title>
 
 <style>
 html,body{
@@ -246,6 +246,8 @@ html,body{
   <button id="toggleDigital" class="btn">Digital</button>
   <button id="startTurning" class="btn" disabled>Start Turning</button>
   <button id="stopTurning" class="btn" disabled>Stop Turning</button>
+  <button id="aheadTurning" class="btn">AHEAD</button>
+  <button id="asternTurning" class="btn">ASTERN</button>
 </div>
 
 <div id="mainLayout">
@@ -256,6 +258,7 @@ html,body{
     <div id="deflAngle">Crank angle: 190.0°</div>
     <div id="deflValue" class="deflLine">Deflection: +0.000 mm</div>
     <div id="bearingWear" class="deflLine">Main Bearing Wear Index: 0.00</div>
+    <div id="manufacturerLimit" class="deflLine">Manufacturer Limit: ±0.200 mm</div>
     <div id="turnStatus" class="deflLine">Status: Set offset with + / −</div>
 
     <div id="mechWrap">
@@ -288,7 +291,7 @@ html,body{
       </svg>
     </div>
 
-    <div id="deflSub">1 measurement cycle / 5 minutes • 0° = ΑΝΣ / TDC • indications start from zero and change gradually</div>
+    <div id="deflSub">1 measurement cycle / 5 minutes • 0° = ΑΝΣ / TDC • wear index = |deflection| / manufacturer limit</div>
   </div>
 
   <!-- CENTER: dial -->
@@ -489,6 +492,8 @@ const startTurningBtn = document.getElementById("startTurning");
 const stopTurningBtn = document.getElementById("stopTurning");
 const plusBtn = document.getElementById("plus");
 const minusBtn = document.getElementById("minus");
+const aheadBtn = document.getElementById("aheadTurning");
+const asternBtn = document.getElementById("asternTurning");
 const digital = document.getElementById("digital");
 
 let baseHundredths = 401 + Math.floor(Math.random() * 99); // 4.01..4.99 mm
@@ -523,14 +528,15 @@ function applyBezel(){
   bezel.setAttribute("transform", `rotate(${bezelAngle} 75 75)`);
 }
 function targetBezelAngle(){
-  // align dial "0" to current big needle at the initial/base value
-  return normalizeDeg((baseHundredths % 100) * 3.6);
+  // Align dial "0" to the current big needle position.
+  // This is checked after automatic or manual turning stops.
+  return normalizeDeg((currentHundredths % 100) * 3.6);
 }
 function isOffsetAligned(){
   return angularDifference(bezelAngle, targetBezelAngle()) <= 0.20;
 }
 function nudge(dir){
-  if(mechRunning) return; // keep offset fixed during turning
+  if(mechRunning || manualDir !== 0) return; // keep offset fixed during turning
   bezelAngle = (bezelAngle + dir * STEP_DEG + 360.0) % 360.0;
   applyBezel();
   updateCalibrationState();
@@ -573,6 +579,7 @@ pos.addEventListener("input", () => {
 const deflAngleEl = document.getElementById("deflAngle");
 const deflValueEl = document.getElementById("deflValue");
 const bearingWearEl = document.getElementById("bearingWear");
+const manufacturerLimitEl = document.getElementById("manufacturerLimit");
 const turnStatusEl = document.getElementById("turnStatus");
 
 const crankLine = document.getElementById("crankLine");
@@ -591,6 +598,9 @@ const SLIDER_H = 26;
 const REV_MS = 300000; // 5 minutes
 const DISPLAY_START_DEG = 190;
 const DISPLAY_END_DEG = 170;
+// Manufacturer allowable deflection limit used for the relative wear index.
+// Replace this value with the actual limit from the engine maker's manual.
+const MANUFACTURER_LIMIT_MM = 0.200;
 // Angle convention: 0° at piston TDC / ΑΝΣ.
 
 let mechRunning = false;
@@ -598,11 +608,21 @@ let mechProgress = 0;
 let lastFrameTime = performance.now();
 let turningElapsedMs = 0;
 
+// Crank angle state. 0° = ΑΝΣ / TDC.
+let currentCrankDeg = DISPLAY_START_DEG;      // initial position: 190°
+let runStartCrankDeg = DISPLAY_START_DEG;
+let runTravelDeg = normalizeDeg(DISPLAY_END_DEG - DISPLAY_START_DEG); // 340° for 190° -> 170°
+let runDurationMs = REV_MS * (runTravelDeg / 360.0);
+let reached170Stop = false;
+
+// Manual turning gear state. Buttons are always active.
+let manualDir = 0; // +1 = AHEAD, -1 = ASTERN
+const MANUAL_DEG_PER_SEC = 360.0 / (REV_MS / 1000.0); // same speed as automatic 190° → 170° turning
+
 function updateMechanism(progress){
   // 0° is at piston TDC / ΑΝΣ.
   // In SVG coordinates, TDC is the crank pin at the top, so the drawing angle is crankAngle - 90°.
-  // The measurement cycle starts at 190° and ends at 170° through 360°/0°.
-  const crankDegTDC = normalizeDeg(DISPLAY_START_DEG + progress * 340.0);
+  const crankDegTDC = normalizeDeg(currentCrankDeg);
   const theta = (crankDegTDC - 90.0) * Math.PI / 180.0;
 
   const pinX = MECH_CX + CRANK_R * Math.cos(theta);
@@ -643,25 +663,24 @@ function updateMechanism(progress){
 
   const deflection = ramp * (wave1 + wave2 + drift);
 
-  // Wear index also starts from zero and changes gradually.
-  const wearRaw =
-    0.55
-    + 0.26 * Math.sin(2 * Math.PI * progress - 0.4)
-    + 0.09 * Math.sin(6 * Math.PI * progress + 0.2)
-    - (0.55 + 0.26 * Math.sin(-0.4) + 0.09 * Math.sin(0.2));
-
-  const wearIndex = clamp(ramp * Math.abs(wearRaw) * 1.6, 0, 1.00);
+  // Main Bearing Wear Index:
+  // relative approach / exceedance of the manufacturer's deflection limit.
+  // 0.50 = 50% of limit, 1.00 = at limit, >1.00 = limit exceeded.
+  const wearIndex = Math.abs(deflection) / MANUFACTURER_LIMIT_MM;
 
   deflValueEl.textContent =
     "Deflection: " + (deflection >= 0 ? "+" : "") + deflection.toFixed(3) + " mm";
 
+  const wearPercent = wearIndex * 100.0;
   bearingWearEl.textContent =
-    "Main Bearing Wear Index: " + wearIndex.toFixed(2);
+    "Main Bearing Wear Index: " + wearIndex.toFixed(2) + " (" + wearPercent.toFixed(0) + "%)";
+  if(manufacturerLimitEl){
+    manufacturerLimitEl.textContent =
+      "Manufacturer Limit: ±" + MANUFACTURER_LIMIT_MM.toFixed(3) + " mm";
+  }
 
-  // During turning, show the changing indications on the micrometer.
-  // Because the dial has been offset-aligned, these start from zero indication
-  // and then vary smoothly around that zero.
-  if(mechRunning){
+  // During automatic or manual turning, show the changing indications on the micrometer.
+  if(mechRunning || manualDir !== 0){
     const simHundredths = clamp(baseHundredths + deflection * 100.0, 0, 1000);
     setDisplay(simHundredths);
     pos.value = String(Math.round(simHundredths));
@@ -669,13 +688,24 @@ function updateMechanism(progress){
 }
 
 function updateCalibrationState(){
+  // AHEAD / ASTERN are intentionally never disabled.
+  if(manualDir !== 0){
+    startTurningBtn.disabled = true;
+    stopTurningBtn.disabled = true;
+    pos.disabled = true;
+    plusBtn.disabled = true;
+    minusBtn.disabled = true;
+    turnStatusEl.textContent = manualDir > 0 ? "Status: Manual Turning AHEAD" : "Status: Manual Turning ASTERN";
+    return;
+  }
+
   if(mechRunning){
     startTurningBtn.disabled = true;
     stopTurningBtn.disabled = false;
     pos.disabled = true;
     plusBtn.disabled = true;
     minusBtn.disabled = true;
-    turnStatusEl.textContent = "Status: Turning";
+    turnStatusEl.textContent = "Status: Turning 190° → 170°";
     return;
   }
 
@@ -686,10 +716,14 @@ function updateCalibrationState(){
 
   if(isOffsetAligned()){
     startTurningBtn.disabled = false;
-    turnStatusEl.textContent = "Status: Ready - offset aligned";
+    turnStatusEl.textContent = reached170Stop
+      ? "Status: 170° reached - aligned, press Start"
+      : "Status: Ready - offset aligned";
   }else{
     startTurningBtn.disabled = true;
-    turnStatusEl.textContent = "Status: Set offset with + / −";
+    turnStatusEl.textContent = reached170Stop
+      ? "Status: 170° reached - align with + / −"
+      : "Status: Set offset with + / −";
   }
 }
 
@@ -698,32 +732,109 @@ function animateMechanism(now){
   lastFrameTime = now;
 
   if(mechRunning){
-    // One measurement cycle in 5 minutes.
+    // Automatic procedure: go from the current angle to 170° and stop.
     turningElapsedMs += dt;
-    mechProgress = (turningElapsedMs / REV_MS) % 1.0;
+
+    const progress = clamp(turningElapsedMs / runDurationMs, 0, 1);
+    mechProgress = progress;
+    currentCrankDeg = normalizeDeg(runStartCrankDeg + progress * runTravelDeg);
+
+    if(progress >= 1){
+      currentCrankDeg = DISPLAY_END_DEG; // stop exactly at 170°
+      mechRunning = false;
+      reached170Stop = true;
+
+      // Freeze the current indication as the new reference until the operator aligns the bezel.
+      baseHundredths = currentHundredths;
+      pos.value = String(Math.round(currentHundredths));
+    }
+  }
+
+  if(manualDir !== 0){
+    // Manual turning gear. Pressing AHEAD/ASTERN stops the automatic process.
+    const deltaDeg = manualDir * MANUAL_DEG_PER_SEC * (dt / 1000.0);
+    currentCrankDeg = normalizeDeg(currentCrankDeg + deltaDeg);
+
+    // Progress is changed smoothly for indication generation. It is clamped to avoid jumps.
+    mechProgress = clamp(mechProgress + deltaDeg / 340.0, 0, 1);
+    turningElapsedMs = Math.max(turningElapsedMs, 20000); // keep indications responsive after manual command
   }
 
   updateMechanism(mechProgress);
+  updateCalibrationState();
   requestAnimationFrame(animateMechanism);
 }
 
 startTurningBtn.addEventListener("click", () => {
   if(!isOffsetAligned()) return;
+
+  // The current aligned indication becomes the reference for the next automatic run.
+  baseHundredths = currentHundredths;
+
+  runStartCrankDeg = currentCrankDeg;
+  runTravelDeg = normalizeDeg(DISPLAY_END_DEG - runStartCrankDeg);
+
+  // If already at 170°, make one full revolution and stop again at 170°.
+  if(runTravelDeg < 0.001){
+    runTravelDeg = 360.0;
+  }
+
+  // Keep physical speed: 1 full revolution in 5 minutes.
+  runDurationMs = REV_MS * (runTravelDeg / 360.0);
+
   mechProgress = 0;
   turningElapsedMs = 0;
+  reached170Stop = false;
   mechRunning = true;
+  manualDir = 0;
   updateMechanism(0);
   updateCalibrationState();
 });
 
 stopTurningBtn.addEventListener("click", () => {
   mechRunning = false;
+  manualDir = 0;
+  baseHundredths = currentHundredths;
   updateCalibrationState();
 });
+
+
+function startManualTurning(dir){
+  // AHEAD / ASTERN always override and stop the automatic 190° → 170° process.
+  mechRunning = false;
+  manualDir = dir;
+  baseHundredths = currentHundredths;
+  reached170Stop = false;
+  updateCalibrationState();
+}
+
+function stopManualTurning(){
+  if(manualDir !== 0){
+    manualDir = 0;
+    baseHundredths = currentHundredths;
+    updateCalibrationState();
+  }
+}
+
+aheadBtn.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  startManualTurning(+1);
+});
+asternBtn.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  startManualTurning(-1);
+});
+
+["pointerup","pointerleave","pointercancel"].forEach(ev => {
+  aheadBtn.addEventListener(ev, stopManualTurning);
+  asternBtn.addEventListener(ev, stopManualTurning);
+});
+window.addEventListener("pointerup", stopManualTurning);
 
 // initialize
 applyBezel();
 turningElapsedMs = 0;
+currentCrankDeg = DISPLAY_START_DEG; // initial position: 190°
 updateMechanism(0);
 updateCalibrationState();
 requestAnimationFrame(animateMechanism);
